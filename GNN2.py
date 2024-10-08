@@ -12,8 +12,16 @@ from tqdm.auto import tqdm
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
-from preprocess2 import extract_descriptors_and_build_graph2
+from preprocess2 import extract_descriptors_and_build_graph3
+from transformers import SuperPointImageProcessor, SuperPointForKeypointDetection
 
+# 初始化處理器和模型
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+processor = SuperPointImageProcessor()
+superpoint_model = SuperPointForKeypointDetection.from_pretrained(
+    "magic-leap-community/superpoint"
+).to(device)
+superpoint_model.eval()
 myseed = 6666
 torch.manual_seed(myseed)
 torch.cuda.manual_seed_all(myseed)
@@ -26,7 +34,14 @@ torch.backends.cudnn.benchmark = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
+processor = SuperPointImageProcessor()
+superpoint_model = SuperPointForKeypointDetection.from_pretrained(
+    "magic-leap-community/superpoint"
+).to(device)
+superpoint_model.eval()
 
+
+# 在 Dataset 中使用正確的處理器和模型
 class DescriptorGraphDataset(Dataset):
     def __init__(self, path, mode="train"):
         super(DescriptorGraphDataset, self).__init__()
@@ -49,25 +64,25 @@ class DescriptorGraphDataset(Dataset):
 
     def __getitem__(self, idx):
         fname = self.files[idx]
-        data = extract_descriptors_and_build_graph2(fname)
-        x, edge_index, pos, edge_attr = (
-            data  # x 是特徵 edge_index 是紀錄兩節點是否有edge, pos是座標 ,edge_attr 是邊權重
+        data = extract_descriptors_and_build_graph3(
+            fname, processor=processor, superpoint_model=superpoint_model, device=device
         )
+        x, edge_index, pos, edge_attr = data
 
-        # 由於資料切割方式，檔案命名為 編號_label
+        # 取得標籤
         try:
             file_parts = os.path.basename(fname).split("_")
             label_str = file_parts[1].split(".")[0]
             label = int(label_str)
         except:
-            label = -1  # 以防萬一
+            label = -1
 
-        # 創建PyTorch Geometric 的graph型態
+        # 創建 PyTorch Geometric 的資料格式
         graph_data = Data(
             x=x,
             edge_index=edge_index,
             edge_attr=edge_attr,
-            y=torch.tensor([label], dtype=torch.float),  # pytorch強制用的
+            y=torch.tensor([label], dtype=torch.float),
             pos=pos,
         )
 
