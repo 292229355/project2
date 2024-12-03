@@ -118,8 +118,8 @@ def extract_descriptors_and_build_graph2(
     edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
     edge_attr = torch.tensor(edge_attr, dtype=torch.float)
 
-    x = torch.from_numpy(descriptors).float()
-    y = torch.from_numpy(keypoint_coords).float()  # 關鍵點座標
+    x = torch.from_numpy(descriptors).float().to(device)
+    y = torch.from_numpy(keypoint_coords).float().to(device)  # 關鍵點座標
 
     return (
         x,
@@ -170,14 +170,8 @@ def andm(A, gamma, beta):
     # Apply the threshold to prune the edges
     AT = torch.where(A > Ti, A, torch.zeros_like(A))  # (n x n)
 
-    # Normalize the adjacency matrix
-    AN = torch.zeros_like(AT)
-    for i in range(n):
-        neighbors = AT[i] > 0  # (n,)
-        if neighbors.any():
-            AN[i, neighbors] = torch.exp(AT[i, neighbors]) / torch.sum(
-                torch.exp(AT[i, neighbors])
-            )
+    # Normalize the adjacency matrix using vectorized operations
+    AN = F.softmax(AT, dim=1) * (AT > 0).float()  # (n x n)
 
     return AN
 
@@ -213,7 +207,7 @@ class AttentionModule(nn.Module):
 
         # Compute Matt
         Matt = torch.sigmoid(torch.matmul(attention_scores, V))  # (n x dk)
-        Matt = torch.matmul(Matt, torch.ones((self.dk, 1)).to(X.device))  # (n x 1)
+        Matt = torch.matmul(Matt, torch.ones((self.dk, 1), device=X.device))  # (n x 1)
         Matt = Matt.squeeze(1)  # (n,)
 
         # Expand Matt to (n x n) by repeating
@@ -235,19 +229,19 @@ def calculate_adjacency_matrix_with_andm(X, eta=0.5, dk=64, attention_module=Non
     """
     n, d = X.size()
 
-    # SCM: Calculate similarity matrix
+    # SCM: Calculate similarity matrix using cosine similarity
     with torch.no_grad():
-        # Compute cosine similarity between all pairs
         norm_X = F.normalize(X, p=2, dim=1)  # (n x d)
         Msim = torch.matmul(norm_X, norm_X.t())  # (n x n)
-
-        # Clip values to avoid numerical issues
-        Msim = torch.clamp(Msim, min=-1.0, max=1.0)
+        Msim = torch.clamp(Msim, min=-1.0, max=1.0)  # 防止數值問題
 
         # Apply scm scaling
-        scm_scores = scm(
-            X.unsqueeze(1).repeat(1, n, 1).view(-1, d), X.repeat(n, 1)
-        ).view(n, n)
+        # 在 PyTorch 中實現 scm 函數的向量化版本
+        dotproduct = torch.sum(X.unsqueeze(1) * X.unsqueeze(0), dim=2) / (
+            torch.norm(X, dim=1).unsqueeze(1) * torch.norm(X, dim=1).unsqueeze(0) + 1e-8
+        )  # (n x n)
+        x = dotproduct / (torch.norm(X, dim=1).unsqueeze(1) ** 0.5 + 1e-8)  # (n x n)
+        scm_scores = stable_sigmoid(x)  # (n x n)
 
     # SAM: Self-attention mechanism using PyTorch
     if attention_module is not None:
@@ -256,10 +250,11 @@ def calculate_adjacency_matrix_with_andm(X, eta=0.5, dk=64, attention_module=Non
         Matt = torch.zeros(n, n).to(X.device)
 
     # Combine SCM and SAM
-    A = eta * Msim + (1 - eta) * Matt  # (n x n)
+    A = eta * scm_scores + (1 - eta) * Matt  # (n x n)
 
     # Define learnable parameters for ANDM (gamma and beta)
-    # Initialize as learnable parameters
+    # 這裡建議將 gamma 和 beta 作為 ANDM 的一部分，而不是每次計算時隨機初始化
+    # 為簡單起見，我們暫時使用隨機初始化
     gamma = torch.rand(n, 1, device=X.device)  # (n x 1)
     beta = torch.rand(n, 1, device=X.device)  # (n x 1)
 
@@ -292,7 +287,13 @@ def extract_descriptors_and_build_graph_with_andm(
     # If no nodes are detected, return empty results
     if x.size(0) == 0:
         print("No nodes detected, returning zero adjacency matrix.")
-        return x, edge_index, y, edge_attr, torch.zeros((1, 1), dtype=torch.float)
+        return (
+            x,
+            edge_index,
+            y,
+            edge_attr,
+            torch.zeros((1, 1), dtype=torch.float).to(device),
+        )
 
     # Convert node features to PyTorch tensor (already in tensor form)
     feature_matrix = x  # (n x d)
@@ -381,16 +382,16 @@ class DescriptorGraphDataset(Dataset):
             adj_indices = torch.nonzero(adjacency_matrix, as_tuple=False).t()
             adj_weights = adjacency_matrix[adj_indices[0], adj_indices[1]]
         else:
-            adj_indices = torch.empty((2, 0), dtype=torch.long)
-            adj_weights = torch.empty((0,), dtype=torch.float)
+            adj_indices = torch.empty((2, 0), dtype=torch.long).to(device)
+            adj_weights = torch.empty((0,), dtype=torch.float).to(device)
 
         # Create PyTorch Geometric data object
         graph_data = Data(
-            x=x,
-            edge_index=adj_indices,
-            edge_attr=adj_weights,
-            y=torch.tensor([label], dtype=torch.float),
-            pos=pos,
+            x=x.to(device),
+            edge_index=adj_indices.to(device),
+            edge_attr=adj_weights.to(device),
+            y=torch.tensor([label], dtype=torch.float).to(device),
+            pos=pos.to(device),
         )
 
         return graph_data
@@ -469,7 +470,7 @@ def validate(model, loader, criterion):
 
 
 if __name__ == "__main__":
-    dataset_dir = "/content/drive/MyDrive/ADM_dataset"
+    dataset_dir = "dataset/Inpaint_dataset"
     exp_name = "Inpaint"
 
     os.makedirs("models", exist_ok=True)
@@ -566,7 +567,9 @@ if __name__ == "__main__":
 
     model_file = f"models/{exp_name}_best.ckpt"
     model_best = GATClassifier(input_dim).to(device)
-    model_best.load_state_dict(torch.load(model_file))
+    model_best.load_state_dict(
+        torch.load(model_file, map_location=device)
+    )  # 使用 map_location
     model_best.eval()
 
     prediction = []
